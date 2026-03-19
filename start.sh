@@ -1,0 +1,1 @@
+python -m minisgl --model "Qwen/Qwen3-4B-Thinking-2507" --attn qfa

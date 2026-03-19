@@ -15,11 +15,12 @@ def main():
 
     # align the hyperparameters
     llm = LLM(
-        "Qwen/Qwen3-0.6B",
+        "Qwen/Qwen3-4B-Thinking-2507",
         max_seq_len_override=4096,
         max_extend_tokens=16384,
         cuda_graph_max_bs=256,
         page_size=256,
+        attention_backend="fi,qfa"
     )
 
     prompt_token_ids = [
@@ -30,6 +31,7 @@ def main():
         for _ in range(num_seqs)
     ]
     llm.generate(["Benchmark: "], SamplingParams(temperature=0.1))  # to warm up flashinfer
+    print("Warm up done")
     t = time.time()
     llm.generate(prompt_token_ids, sampling_params)
     t = time.time() - t
