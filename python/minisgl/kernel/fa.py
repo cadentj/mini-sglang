@@ -6,11 +6,11 @@ import triton.language as tl
 
 
 @triton.jit
-def _paged_attn_kernel(
+def _paged_attn_stats_kernel(
     q_ptr,
     k_cache_ptr,
-    v_cache_ptr,
-    o_ptr,
+    m_ptr,
+    l_ptr,
     q_seq_ids_ptr,
     q_positions_ptr,
     seq_lens_q_ptr,
@@ -22,14 +22,12 @@ def _paged_attn_kernel(
     stride_kt,
     stride_kh,
     stride_kd,
-    stride_vb,
-    stride_vt,
-    stride_vh,
-    stride_vd,
-    stride_ot,
-    stride_oh,
     stride_bt0,
     stride_bt1,
+    stride_mt,
+    stride_mh,
+    stride_lt,
+    stride_lh,
     softmax_scale,
     num_heads,
     num_kv_heads,
@@ -56,8 +54,6 @@ def _paged_attn_kernel(
 
     m_i = float("-inf")
     l_i = 0.0
-    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
-
     for start_n in range(0, seqlen_k, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         valid_n = offs_n < seqlen_k
@@ -87,6 +83,107 @@ def _paged_attn_kernel(
         m_ij = tl.maximum(m_i, tl.max(scores, axis=0))
         p = tl.exp(scores - m_ij)
         alpha = tl.exp(m_i - m_ij)
+        l_i = l_i * alpha + tl.sum(p, axis=0)
+        m_i = m_ij
+
+    tl.store(m_ptr + q_idx * stride_mt + q_head * stride_mh, m_i)
+    tl.store(l_ptr + q_idx * stride_lt + q_head * stride_lh, l_i)
+
+
+@triton.jit
+def _paged_attn_quant_out_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    o_ptr,
+    m_ptr,
+    l_ptr,
+    q_seq_ids_ptr,
+    q_positions_ptr,
+    seq_lens_q_ptr,
+    seq_lens_k_ptr,
+    block_table_ptr,
+    stride_qt,
+    stride_qh,
+    stride_kb,
+    stride_kt,
+    stride_kh,
+    stride_kd,
+    stride_vb,
+    stride_vt,
+    stride_vh,
+    stride_vd,
+    stride_ot,
+    stride_oh,
+    stride_bt0,
+    stride_bt1,
+    stride_mt,
+    stride_mh,
+    stride_lt,
+    stride_lh,
+    softmax_scale,
+    quant_qmax,
+    quant_scale_eps,
+    num_heads,
+    num_kv_heads,
+    cache_block_size,
+    headdim,
+    BLOCK_N: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    q_idx = tl.program_id(0)
+    q_head = tl.program_id(1)
+
+    seq_idx = tl.load(q_seq_ids_ptr + q_idx)
+    q_pos = tl.load(q_positions_ptr + q_idx)
+    seqlen_q = tl.load(seq_lens_q_ptr + seq_idx)
+    seqlen_k = tl.load(seq_lens_k_ptr + seq_idx)
+
+    gqa_group_size = num_heads // num_kv_heads
+    kv_head = q_head // gqa_group_size
+    q_abs_pos = q_pos + (seqlen_k - seqlen_q)
+
+    offs_d = tl.arange(0, BLOCK_D)
+    q_ptrs = q_ptr + q_idx * stride_qt + q_head * stride_qh + offs_d
+    q = tl.load(q_ptrs, mask=offs_d < headdim, other=0.0).to(tl.float32)
+    m_i = tl.load(m_ptr + q_idx * stride_mt + q_head * stride_mh)
+    l_i = tl.load(l_ptr + q_idx * stride_lt + q_head * stride_lh)
+    acc = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    for start_n in range(0, seqlen_k, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        valid_n = offs_n < seqlen_k
+        causal_n = offs_n <= q_abs_pos
+        visible_n = valid_n & causal_n
+        logical_block = offs_n // cache_block_size
+        in_block_offset = offs_n % cache_block_size
+
+        phys_block = tl.load(
+            block_table_ptr + seq_idx * stride_bt0 + logical_block * stride_bt1,
+            mask=valid_n,
+            other=0,
+        )
+
+        k_ptrs = (
+            k_cache_ptr
+            + phys_block[:, None] * stride_kb
+            + in_block_offset[:, None] * stride_kt
+            + kv_head * stride_kh
+            + offs_d[None, :] * stride_kd
+        )
+        mask = valid_n[:, None] & (offs_d[None, :] < headdim)
+        k = tl.load(k_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+        scores = tl.sum(k * q[None, :], axis=1) * softmax_scale
+        scores = tl.where(visible_n, scores, float("-inf"))
+        p = tl.exp(scores - m_i) / l_i
+        p = tl.where(visible_n, p, 0.0)
+
+        amax = tl.max(tl.abs(p), axis=0)
+        scale = tl.maximum(amax / quant_qmax, quant_scale_eps)
+        p_scaled = p / scale
+        p_rounded = tl.where(p_scaled >= 0, tl.floor(p_scaled + 0.5), -tl.floor(-p_scaled + 0.5))
+        p_q = tl.clamp(p_rounded, -quant_qmax, quant_qmax) * scale
 
         v_ptrs = (
             v_cache_ptr
@@ -96,14 +193,10 @@ def _paged_attn_kernel(
             + offs_d[None, :] * stride_vd
         )
         v = tl.load(v_ptrs, mask=mask, other=0.0).to(tl.float32)
+        acc += tl.sum(v * p_q[:, None], axis=0)
 
-        acc = acc * alpha + tl.sum(v * p[:, None], axis=0)
-        l_i = l_i * alpha + tl.sum(p, axis=0)
-        m_i = m_ij
-
-    out = acc / l_i
     o_ptrs = o_ptr + q_idx * stride_ot + q_head * stride_oh + offs_d
-    tl.store(o_ptrs, out.to(q_ptr.dtype.element_ty), mask=offs_d < headdim)
+    tl.store(o_ptrs, acc.to(q_ptr.dtype.element_ty), mask=offs_d < headdim)
 
 
 def _check_paged_inputs(
@@ -162,6 +255,9 @@ def _paged_attention(
     block_table: torch.Tensor,
     softmax_scale: float,
     causal: bool,
+    *,
+    quant_bits: int | None = None,
+    quant_block_size: int | None = None,
 ) -> torch.Tensor:
     _check_paged_inputs(q, k_cache, v_cache, seq_lens_q, seq_lens_k, block_table, causal)
     if q.shape[0] == 0:
@@ -173,15 +269,57 @@ def _paged_attention(
     block_headdim = triton.next_power_of_2(head_dim)
     if block_headdim > 256:
         raise NotImplementedError(f"Head dimension {head_dim} is not supported yet.")
+    if quant_bits is not None:
+        if quant_bits < 2:
+            raise ValueError(f"quant_bits must be >= 2, got {quant_bits}.")
+        if quant_block_size != 64:
+            raise NotImplementedError(
+                f"Only quant_block_size=64 is supported right now, got {quant_block_size}."
+            )
 
     out = torch.empty_like(q)
+    m = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
+    l = torch.empty((q.shape[0], q.shape[1]), device=q.device, dtype=torch.float32)
     num_warps = 4 if block_headdim <= 64 else 8
     grid = (q.shape[0], q.shape[1])
-    _paged_attn_kernel[grid](
+    _paged_attn_stats_kernel[grid](
+        q,
+        k_cache,
+        m,
+        l,
+        q_seq_ids,
+        q_positions,
+        seq_lens_q,
+        seq_lens_k,
+        block_table,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        block_table.stride(0),
+        block_table.stride(1),
+        m.stride(0),
+        m.stride(1),
+        l.stride(0),
+        l.stride(1),
+        softmax_scale,
+        q.shape[1],
+        k_cache.shape[2],
+        k_cache.shape[1],
+        head_dim,
+        BLOCK_N=64,
+        BLOCK_D=block_headdim,
+        num_warps=num_warps,
+    )
+    out_args = [
         q,
         k_cache,
         v_cache,
         out,
+        m,
+        l,
         q_seq_ids,
         q_positions,
         seq_lens_q,
@@ -201,11 +339,24 @@ def _paged_attention(
         out.stride(1),
         block_table.stride(0),
         block_table.stride(1),
+        m.stride(0),
+        m.stride(1),
+        l.stride(0),
+        l.stride(1),
         softmax_scale,
-        q.shape[1],
-        k_cache.shape[2],
-        k_cache.shape[1],
-        head_dim,
+    ]
+    if quant_bits is not None:
+        out_args.extend([float((1 << (quant_bits - 1)) - 1), 1e-12])
+    out_args.extend(
+        [
+            q.shape[1],
+            k_cache.shape[2],
+            k_cache.shape[1],
+            head_dim,
+        ]
+    )
+    _paged_attn_quant_out_kernel[grid](
+        *out_args,
         BLOCK_N=64,
         BLOCK_D=block_headdim,
         num_warps=num_warps,
@@ -263,7 +414,7 @@ def dense_flash_attn_varlen(
     return out
 
 
-def paged_flash_attn_varlen(
+def paged_flash_attn_varlen_quant(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -271,6 +422,9 @@ def paged_flash_attn_varlen(
     cu_seqlens_k: torch.Tensor,
     block_table: torch.Tensor,
     softmax_scale: float | None = None,
+    *,
+    quant_bits: int = 4,
+    quant_block_size: int = 64,
     causal: bool = True,
 ) -> torch.Tensor:
     if cu_seqlens_q.ndim != 1 or cu_seqlens_k.ndim != 1:
@@ -294,16 +448,21 @@ def paged_flash_attn_varlen(
         block_table.to(dtype=torch.int32),
         scale,
         causal,
+        quant_bits=quant_bits,
+        quant_block_size=quant_block_size,
     )
 
 
-def paged_flash_attn_decode(
+def paged_flash_attn_decode_quant(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     cache_seqlens: torch.Tensor,
     block_table: torch.Tensor,
     softmax_scale: float | None = None,
+    *,
+    quant_bits: int = 4,
+    quant_block_size: int = 64,
     causal: bool = True,
 ) -> torch.Tensor:
     if q.ndim != 3:
@@ -333,4 +492,6 @@ def paged_flash_attn_decode(
         block_table.to(dtype=torch.int32),
         scale,
         causal,
+        quant_bits=quant_bits,
+        quant_block_size=quant_block_size,
     )

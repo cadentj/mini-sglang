@@ -20,7 +20,7 @@ def main():
         max_extend_tokens=16384,
         cuda_graph_max_bs=256,
         page_size=256,
-        attention_backend="fi,qfa"
+        attention_backend="qfa"
     )
 
     prompt_token_ids = [

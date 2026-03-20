@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, List, Tuple
 
 import torch
 from minisgl.core import Batch, get_global_ctx
-from minisgl.kernel.fa import paged_flash_attn_decode, paged_flash_attn_varlen
+from minisgl.kernel.fa import paged_flash_attn_decode_quant, paged_flash_attn_varlen_quant
 from minisgl.utils import is_sm100_supported
 
 from .base import BaseAttnBackend, BaseAttnMetadata
@@ -35,6 +35,9 @@ class FAMetadata(BaseAttnMetadata):
 
 
 class QuantizedFlashAttentionBackend(BaseAttnBackend):
+    quant_bits = 4
+    quant_block_size = 64
+
     def __init__(self, config: ModelConfig):
         ctx = get_global_ctx()
         self.config = config
@@ -158,17 +161,19 @@ def _fa_sgl_impl(
     del version, sm_margin, window_size, softcap, num_splits, pack_gqa
 
     if max_seqlen_q == 1:
-        return paged_flash_attn_decode(
+        return paged_flash_attn_decode_quant(
             q=q,
             k_cache=k_cache,
             v_cache=v_cache,
             cache_seqlens=cache_seqlens,
             block_table=page_table,
             softmax_scale=softmax_scale,
+            quant_bits=QuantizedFlashAttentionBackend.quant_bits,
+            quant_block_size=QuantizedFlashAttentionBackend.quant_block_size,
             causal=causal,
         )
 
-    return paged_flash_attn_varlen(
+    return paged_flash_attn_varlen_quant(
         q=q,
         k_cache=k_cache,
         v_cache=v_cache,
@@ -176,5 +181,7 @@ def _fa_sgl_impl(
         cu_seqlens_k=cu_seqlens_k,
         block_table=page_table,
         softmax_scale=softmax_scale,
+        quant_bits=QuantizedFlashAttentionBackend.quant_bits,
+        quant_block_size=QuantizedFlashAttentionBackend.quant_block_size,
         causal=causal,
     )
